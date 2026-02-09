@@ -1,0 +1,393 @@
+{
+  "name": "03 - Planning Intervention",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "artisan-planifier-intervention",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000001",
+      "name": "Webhook Planification",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "artisan-planifier-intervention"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validation de la demande d'intervention\nconst body = $input.first().json.body;\n\n// Champs requis\nconst required = ['nom', 'prenom', 'email', 'telephone', 'date_intervention', 'heure_debut', 'duree', 'type_travaux', 'adresse_chantier'];\nfor (const field of required) {\n  if (!body[field] || body[field].toString().trim() === '') {\n    return [{ json: { valid: false, error: `Champ manquant: ${field}` } }];\n  }\n}\n\n// Validation email\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!emailRegex.test(body.email)) {\n  return [{ json: { valid: false, error: 'Email invalide' } }];\n}\n\n// Normalisation téléphone\nlet tel = body.telephone.toString().replace(/[^0-9+]/g, '');\nif (tel.startsWith('0')) tel = '+33' + tel.substring(1);\n\n// Validation date (pas dans le passé)\nconst dateStr = body.date_intervention;\nconst heureDebut = parseInt(body.heure_debut);\nconst duree = Math.min(Math.max(parseInt(body.duree) || 1, 1), 4);\n\nconst now = new Date();\nconst interventionDate = new Date(dateStr + 'T' + String(heureDebut).padStart(2, '0') + ':00:00+01:00');\n\nif (interventionDate < now) {\n  return [{ json: { valid: false, error: 'La date est dans le passé' } }];\n}\n\n// Heures ouvrables (8h-18h)\nif (heureDebut < 8 || heureDebut > 18) {\n  return [{ json: { valid: false, error: 'Heure hors plage (8h-18h)' } }];\n}\n\n// Calcul dates début/fin\nconst dateDebut = dateStr + 'T' + String(heureDebut).padStart(2, '0') + ':00:00+01:00';\nconst heureFin = heureDebut + duree;\nconst dateFin = dateStr + 'T' + String(heureFin).padStart(2, '0') + ':00:00+01:00';\n\n// Plage pour vérification Calendar (journée entière)\nconst timeMin = dateStr + 'T08:00:00+01:00';\nconst timeMax = dateStr + 'T18:00:00+01:00';\n\nfunction san(s) {\n  return s ? s.toString().trim().replace(/<[^>]*>/g, '').replace(/[<>\"'&]/g, '') : '';\n}\n\nreturn [{ json: {\n  valid: true,\n  nom: san(body.nom),\n  prenom: san(body.prenom),\n  nom_complet: san(body.prenom) + ' ' + san(body.nom),\n  email: san(body.email).toLowerCase(),\n  telephone: tel,\n  date_intervention: dateStr,\n  heure_debut: heureDebut,\n  duree: duree,\n  type_travaux: san(body.type_travaux),\n  adresse_chantier: san(body.adresse_chantier),\n  notes: san(body.notes || ''),\n  date_debut: dateDebut,\n  date_fin: dateFin,\n  time_min: timeMin,\n  time_max: timeMax\n} }];"
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000002",
+      "name": "Validation Demande",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Demande Valide?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [750, 300]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "returnAll": true,
+        "options": {
+          "timeMin": "={{ $json.time_min }}",
+          "timeMax": "={{ $json.time_max }}",
+          "singleEvents": true,
+          "orderBy": "startTime"
+        }
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000004",
+      "name": "Vérifier Disponibilité Calendar",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 3,
+      "position": [1000, 200],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GCAL_CREDENTIAL_ID",
+          "name": "Google Calendar OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Analyse des conflits de disponibilité\nconst events = $input.all().map(item => item.json);\nconst demande = $('Validation Demande').first().json;\n\nconst debutDemande = new Date(demande.date_debut).getTime();\nconst finDemande = new Date(demande.date_fin).getTime();\n\nlet conflit = false;\nlet conflitDetail = '';\n\nfor (const event of events) {\n  if (!event.start || !event.end) continue;\n  \n  const debutEvent = new Date(event.start.dateTime || event.start.date).getTime();\n  const finEvent = new Date(event.end.dateTime || event.end.date).getTime();\n  \n  // Vérifier chevauchement\n  if (debutDemande < finEvent && finDemande > debutEvent) {\n    conflit = true;\n    conflitDetail = `Conflit avec: ${event.summary || 'Événement'} (${event.start.dateTime || event.start.date})`;\n    break;\n  }\n}\n\nreturn [{ json: {\n  disponible: !conflit,\n  conflit_detail: conflitDetail,\n  nom_complet: demande.nom_complet\n} }];"
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000005",
+      "name": "Analyse Disponibilité",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-dispo",
+              "leftValue": "={{ $json.disponible }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000006",
+      "name": "Créneau Disponible?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1500, 200]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "start": "={{ $('Validation Demande').item.json.date_debut }}",
+        "end": "={{ $('Validation Demande').item.json.date_fin }}",
+        "additionalFields": {
+          "summary": "[INTERVENTION] {{ $('Validation Demande').item.json.type_travaux }} - {{ $('Analyse Disponibilité').item.json.nom_complet }}",
+          "description": "Client: {{ $('Analyse Disponibilité').item.json.nom_complet }}\nTél: {{ $('Validation Demande').item.json.telephone }}\nEmail: {{ $('Validation Demande').item.json.email }}\nType: {{ $('Validation Demande').item.json.type_travaux }}\nAdresse: {{ $('Validation Demande').item.json.adresse_chantier }}\nNotes: {{ $('Validation Demande').item.json.notes }}",
+          "location": "={{ $('Validation Demande').item.json.adresse_chantier }}",
+          "attendees": [
+            "={{ $('Validation Demande').item.json.email }}"
+          ]
+        }
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000007",
+      "name": "Créer Événement Calendar",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 3,
+      "position": [1750, 100],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GCAL_CREDENTIAL_ID",
+          "name": "Google Calendar OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "create",
+        "databaseId": {
+          "__rl": true,
+          "value": "2ffbd9c2-8a98-81af-9d69-d7bcc67f13a5",
+          "mode": "id"
+        },
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Nom|title",
+              "title": "={{ $('Analyse Disponibilité').item.json.nom_complet }}"
+            },
+            {
+              "key": "adresse de l'intervention|rich_text",
+              "richTextValue": "={{ $('Validation Demande').item.json.adresse_chantier }}"
+            },
+            {
+              "key": "Date intervention|date",
+              "dateValue": "={{ $('Validation Demande').item.json.date_debut }}"
+            },
+            {
+              "key": "Statut|select",
+              "selectValue": "Planifiee"
+            },
+            {
+              "key": "Note|rich_text",
+              "richTextValue": "={{ $('Validation Demande').item.json.notes }}"
+            },
+            {
+              "key": "Artisan|rich_text",
+              "richTextValue": "={{ $('Validation Demande').item.json.type_travaux }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000008",
+      "name": "Notion - Enregistrer Intervention",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [2050, 100],
+      "credentials": {
+        "notionApi": {
+          "id": "NOTION_CREDENTIAL_ID",
+          "name": "Notion API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Validation Demande').item.json.email }}",
+        "subject": "=Confirmation intervention {{ $('Validation Demande').item.json.type_travaux }} - {{ $('Validation Demande').item.json.date_intervention }}",
+        "emailType": "html",
+        "message": "<html><body style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;\">\n<div style=\"background: linear-gradient(135deg, #56ab2f 0%, #a8e063 100%); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;\">\n  <h1 style=\"color: white; margin: 0;\">Intervention confirmée !</h1>\n</div>\n<div style=\"background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;\">\n  <p>Bonjour <strong>{{ $('Analyse Disponibilité').item.json.nom_complet }}</strong>,</p>\n  <p>Votre intervention a été planifiée avec succès.</p>\n  <div style=\"background: white; padding: 20px; border-radius: 8px; border-left: 4px solid #56ab2f; margin: 20px 0;\">\n    <h3 style=\"color: #56ab2f; margin-top: 0;\">Détails de l'intervention</h3>\n    <p><strong>Type :</strong> {{ $('Validation Demande').item.json.type_travaux }}</p>\n    <p><strong>Date :</strong> {{ $('Validation Demande').item.json.date_intervention }}</p>\n    <p><strong>Heure :</strong> {{ $('Validation Demande').item.json.heure_debut }}h00 (durée: {{ $('Validation Demande').item.json.duree }}h)</p>\n    <p><strong>Adresse :</strong> {{ $('Validation Demande').item.json.adresse_chantier }}</p>\n  </div>\n  <h3>Checklist avant intervention</h3>\n  <ul>\n    <li>Vérifiez l'accès au chantier</li>\n    <li>Préparez les documents nécessaires</li>\n    <li>Confirmez l'adresse exacte</li>\n  </ul>\n  <p>Une invitation Google Calendar vous a également été envoyée.</p>\n</div>\n</body></html>",
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000009",
+      "name": "Gmail - Confirmation Intervention",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2350, 100],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, message: 'Intervention planifiée avec succès', date: $('Validation Demande').item.json.date_debut, duree: $('Validation Demande').item.json.duree + 'h' }) }}",
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000010",
+      "name": "Réponse Succès Planning",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2600, 100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Créneau non disponible', detail: $json.conflit_detail }) }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000011",
+      "name": "Réponse Créneau Occupé",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1750, 350]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Validation échouée' }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "c1b2c3d4-0003-4000-8000-000000000012",
+      "name": "Réponse Erreur Validation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1000, 450]
+    }
+  ],
+  "connections": {
+    "Webhook Planification": {
+      "main": [
+        [
+          {
+            "node": "Validation Demande",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validation Demande": {
+      "main": [
+        [
+          {
+            "node": "Demande Valide?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demande Valide?": {
+      "main": [
+        [
+          {
+            "node": "Vérifier Disponibilité Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Réponse Erreur Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vérifier Disponibilité Calendar": {
+      "main": [
+        [
+          {
+            "node": "Analyse Disponibilité",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse Disponibilité": {
+      "main": [
+        [
+          {
+            "node": "Créneau Disponible?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Créneau Disponible?": {
+      "main": [
+        [
+          {
+            "node": "Créer Événement Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Réponse Créneau Occupé",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Créer Événement Calendar": {
+      "main": [
+        [
+          {
+            "node": "Notion - Enregistrer Intervention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion - Enregistrer Intervention": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Confirmation Intervention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Confirmation Intervention": {
+      "main": [
+        [
+          {
+            "node": "Réponse Succès Planning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "pack-artisan"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {}
+}

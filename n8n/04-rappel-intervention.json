@@ -1,0 +1,225 @@
+{
+  "name": "04 - Rappel Intervention J-1",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000001",
+      "name": "CRON Quotidien 8h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calcul de la plage de demain (Europe/Paris)\nconst now = new Date();\n\n// Demain\nconst tomorrow = new Date(now);\ntomorrow.setDate(tomorrow.getDate() + 1);\n\nconst year = tomorrow.getFullYear();\nconst month = String(tomorrow.getMonth() + 1).padStart(2, '0');\nconst day = String(tomorrow.getDate()).padStart(2, '0');\n\nconst targetDate = `${year}-${month}-${day}`;\nconst tomorrowStart = `${targetDate}T00:00:00+01:00`;\nconst tomorrowEnd = `${targetDate}T23:59:59+01:00`;\n\nreturn [{ json: {\n  targetDate,\n  tomorrowStart,\n  tomorrowEnd\n} }];"
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000002",
+      "name": "Init Context Demain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "returnAll": true,
+        "options": {
+          "timeMin": "={{ $json.tomorrowStart }}",
+          "timeMax": "={{ $json.tomorrowEnd }}",
+          "singleEvents": true,
+          "orderBy": "startTime"
+        }
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000003",
+      "name": "Récupérer Événements Demain",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 3,
+      "position": [750, 300],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GCAL_CREDENTIAL_ID",
+          "name": "Google Calendar OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extraire les interventions avec participants\nconst events = $input.all().map(item => item.json);\nconst interventions = [];\n\nfor (const event of events) {\n  // Filtrer les événements qui sont des interventions\n  const titre = event.summary || '';\n  if (!titre.includes('[INTERVENTION]') && !event.attendees) continue;\n  \n  // Extraire les participants (hors organisateur)\n  const attendees = (event.attendees || []).filter(a => !a.organizer && !a.self);\n  \n  for (const attendee of attendees) {\n    // Extraire l'heure\n    let heureIntervention = '';\n    if (event.start && event.start.dateTime) {\n      const d = new Date(event.start.dateTime);\n      heureIntervention = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');\n    }\n    \n    interventions.push({\n      eventId: event.id,\n      titre: titre,\n      adresse: event.location || 'Non spécifiée',\n      dateIntervention: $('Init Context Demain').first().json.targetDate,\n      heureIntervention: heureIntervention,\n      clientEmail: attendee.email,\n      clientNom: attendee.displayName || attendee.email.split('@')[0]\n    });\n  }\n}\n\nreturn [{ json: {\n  count: interventions.length,\n  interventions: interventions\n} }];"
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Extraire Interventions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-count",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000005",
+      "name": "Des Interventions Demain?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1300, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Éclater la liste d'interventions en items individuels\nconst data = $input.first().json;\nconst items = data.interventions.map(intervention => ({ json: intervention }));\nreturn items;"
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000006",
+      "name": "Split Interventions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1550, 200]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.clientEmail }}",
+        "subject": "=Rappel : Intervention prévue demain - {{ $json.titre }}",
+        "emailType": "html",
+        "message": "<html><body style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;\">\n<div style=\"background: linear-gradient(135deg, #f7971e 0%, #ffd200 100%); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;\">\n  <h1 style=\"color: white; margin: 0;\">Rappel d'intervention</h1>\n</div>\n<div style=\"background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;\">\n  <p>Bonjour <strong>{{ $json.clientNom }}</strong>,</p>\n  <p>Nous vous rappelons que vous avez une intervention prévue <strong>demain</strong>.</p>\n  <div style=\"background: white; padding: 20px; border-radius: 8px; border-left: 4px solid #f7971e; margin: 20px 0;\">\n    <h3 style=\"color: #f7971e; margin-top: 0;\">Détails</h3>\n    <p><strong>Intervention :</strong> {{ $json.titre }}</p>\n    <p><strong>Date :</strong> {{ $json.dateIntervention }}</p>\n    <p><strong>Heure :</strong> {{ $json.heureIntervention }}</p>\n    <p><strong>Adresse :</strong> {{ $json.adresse }}</p>\n  </div>\n  <h3>Checklist avant intervention</h3>\n  <ul>\n    <li>Vérifiez l'accès au chantier</li>\n    <li>Préparez les documents nécessaires</li>\n    <li>Confirmez l'adresse exacte</li>\n    <li>Contactez-nous en cas d'empêchement</li>\n  </ul>\n</div>\n</body></html>",
+        "options": {}
+      },
+      "id": "d1b2c3d4-0004-4000-8000-000000000007",
+      "name": "Gmail - Rappel Intervention",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1800, 200],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "d1b2c3d4-0004-4000-8000-000000000008",
+      "name": "No Op (Aucune Intervention)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1550, 400]
+    }
+  ],
+  "connections": {
+    "CRON Quotidien 8h": {
+      "main": [
+        [
+          {
+            "node": "Init Context Demain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Context Demain": {
+      "main": [
+        [
+          {
+            "node": "Récupérer Événements Demain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Récupérer Événements Demain": {
+      "main": [
+        [
+          {
+            "node": "Extraire Interventions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraire Interventions": {
+      "main": [
+        [
+          {
+            "node": "Des Interventions Demain?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Des Interventions Demain?": {
+      "main": [
+        [
+          {
+            "node": "Split Interventions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Op (Aucune Intervention)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Interventions": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Rappel Intervention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Paris"
+  },
+  "tags": [
+    {
+      "name": "pack-artisan"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {}
+}
